@@ -1,3 +1,5 @@
+import torch
+
 from ThirdParty.fastai_helpers import *
 
 
@@ -32,35 +34,38 @@ class SimpleUnetBlock(Module):
         cat_x = self.relu(torch.cat([up_out, self.bn(s)], dim=1))
         return self.conv2(self.conv1(cat_x))
 
+
 class ResFuseNet(Module):
-    def __init__(self, n_in=3, n_classes=7, imsize=(120, 160), norm_type=None, pretrained=False, blur=False,
+    def __init__(self, n_in_main=3, n_in_second=1, n_classes=1, imsize=(120, 160), norm_type=None, pretrained=False,
+                 blur=False,
                  blur_final=True, self_attention=False):
         self.pretrained = pretrained
         self.imsize = imsize
         # Get iterable sequential model from ResNet34 architecture
         encoder_arch = resnet34(pretrained=self.pretrained)
         encoder = nn.Sequential(*list(encoder_arch.children())[:-2])
+        encoder[0] = nn.Conv2d(n_in_main, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
         # Get layer sizes of encoder
         sfs_szs = model_sizes(encoder, size=self.imsize)
         # Get indices of layers where size of activation changes
         sfs_idxs = list(reversed(_get_sfs_idxs(sfs_szs)))
         self.sfs = hook_outputs([encoder[i] for i in sfs_idxs], detach=False)
-        # Get initial conv layers for rgb and depth encoders (cut at ReLU to hook output before maxpool)
-        self.stem_rgb = nn.Sequential(
-            nn.Conv2d(n_in, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False),
+        # Get initial conv layers for main and second encoders (cut at ReLU to hook output before maxpool)
+        self.stem_main = nn.Sequential(
+            nn.Conv2d(n_in_main, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False),
             nn.BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True),
             nn.ReLU(inplace=True))
-        self.stem_depth = nn.Sequential(
-            nn.Conv2d(1, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False),
+        self.stem_second = nn.Sequential(
+            nn.Conv2d(n_in_second, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False),
             nn.BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True),
             nn.ReLU(inplace=True))
         # Initial pooling layers for encoders
-        self.maxpool2d_1_rgb = nn.MaxPool2d(kernel_size=3, stride=2, padding=1, dilation=1, ceil_mode=False)
-        self.maxpool2d_1_depth = nn.MaxPool2d(kernel_size=3, stride=2, padding=1, dilation=1, ceil_mode=False)
+        self.maxpool2d_1_main = nn.MaxPool2d(kernel_size=3, stride=2, padding=1, dilation=1, ceil_mode=False)
+        self.maxpool2d_1_second = nn.MaxPool2d(kernel_size=3, stride=2, padding=1, dilation=1, ceil_mode=False)
         # Get encoder blocks from modules of ResNet34
         encoder_blocks = [block for block in list(encoder.children()) if isinstance(block, nn.Sequential)]
-        self.ec1_rgb, self.ec2_rgb, self.ec3_rgb, self.ec4_rgb = encoder_blocks
-        self.ec1_depth, self.ec2_depth, self.ec3_depth, self.ec4_depth = encoder_blocks
+        self.ec1_main, self.ec2_main, self.ec3_main, self.ec4_main = encoder_blocks
+        self.ec1_second, self.ec2_second, self.ec3_second, self.ec4_second = encoder_blocks
         # ni is number of features from last block of encoder
         ni = sfs_szs[-1][1]
         # Bottleneck for main UNet
@@ -87,34 +92,34 @@ class ResFuseNet(Module):
         self.head = nn.Sequential(ResBlock(1, ni, ni, stride=1, norm_type=norm_type),
                                   ConvLayer(ni, n_classes, ks=1, act_cls=None, norm_type=norm_type))
 
-    def forward(self, rgb, depth, skip_with_fuse=True):
+    def forward(self, main, second, skip_with_fuse=True):
         # 1st hook
-        x = self.stem_rgb(rgb)
-        y = self.stem_depth(depth)
+        x = self.stem_main(main)
+        y = self.stem_second(second)
         hook1 = x
         fuse1 = x + y
 
         # 2nd hook
-        x = self.ec1_rgb(fuse1)
-        y = self.ec1_depth(y)
+        x = self.ec1_main(fuse1)
+        y = self.ec1_second(y)
         hook2 = x
         fuse2 = x + y
 
         # 3rd hook
-        x = self.ec2_rgb(fuse2)
-        y = self.ec2_depth(y)
+        x = self.ec2_main(fuse2)
+        y = self.ec2_second(y)
         hook3 = x
         fuse3 = x + y
 
         # 4th hook
-        x = self.ec3_rgb(fuse3)
-        y = self.ec3_depth(y)
+        x = self.ec3_main(fuse3)
+        y = self.ec3_second(y)
         hook4 = x
         fuse4 = x + y
 
         # final encoder layer
-        x = self.ec4_rgb(fuse4)
-        y = self.ec4_depth(y)
+        x = self.ec4_main(fuse4)
+        y = self.ec4_second(y)
         x = x + y
 
         # middle
@@ -126,8 +131,15 @@ class ResFuseNet(Module):
         x = self.dec2(x, fuse2) if skip_with_fuse else self.dec2(x, hook2)
         x = self.dec1(x, fuse1) if skip_with_fuse else self.dec1(x, hook1)
 
-        if x.shape[-2:] != rgb.shape[-2:]:
-            x = F.interpolate(x, rgb.shape[-2:], mode='nearest')
-        x = torch.cat([rgb, x], dim=1)
+        if x.shape[-2:] != main.shape[-2:]:
+            x = F.interpolate(x, main.shape[-2:], mode='nearest')
+        x = torch.cat([main, x], dim=1)
         x = self.head(x)
         return x
+
+
+m = ResFuseNet(n_in_main=3, n_in_second=1, n_classes=1)
+r = torch.randn(1, 3, 120, 160)
+d = torch.randn(1, 1, 120, 160)
+out = m(r, d)
+print(out.shape)
